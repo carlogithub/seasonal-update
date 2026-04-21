@@ -129,90 +129,39 @@ def compute_era5_anomaly(nino34_raw: xr.DataArray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C3S HINDCAST CLIMATOLOGY
+# C3S FORECAST ENSEMBLE  (monthly resolution)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_hindcast_climatology(grib_path: str) -> dict:
+def load_forecast_ensemble_monthly(grib_path: str,
+                                    era5_raw: xr.DataArray,
+                                    init_year: int) -> xr.DataArray:
     """
-    Load the C3S hindcast climatological mean for one model from a GRIB file.
+    Load C3S monthly-mean forecast members and return per-member Niño 3.4
+    *anomaly* values for each target month.
 
-    The file contains the model's average forecast for each target month
-    (April, May, June), expressed as monthly-mean SST over the Niño 3.4 box.
-    We spatially average it to get one SST value per lead month.
+    Debiasing strategy: we subtract the ERA5 climatological monthly mean
+    (computed over the hindcast period) from each model member's monthly SST.
+    This removes the model's absolute SST level and expresses the forecast as
+    an anomaly in the same observational reference frame as the ERA5 regression,
+    making the prior and the regression directly comparable.
 
-    Returns
-    -------
-    dict mapping lead_month (int, 1-based) → area-mean SST (float, Kelvin)
-
-    Example: {1: 301.2, 2: 301.5, 3: 301.4}
-    where 1 = first target month (April for April init), 2 = May, 3 = June.
-    """
-    print(f"[PROCESS] Loading hindcast climatology from {grib_path} …")
-
-    # cfgrib reads GRIB as xarray Datasets; squeeze=False keeps all dimensions
-    datasets = cfgrib.open_datasets(grib_path, squeeze=False)
-
-    if not datasets:
-        raise RuntimeError(f"Could not read GRIB file: {grib_path}")
-
-    # There may be multiple GRIB messages; combine and look for SST
-    ds = datasets[0]
-    for d in datasets[1:]:
-        try:
-            ds = xr.merge([ds, d])
-        except Exception:
-            pass
-
-    # Find the SST variable — GRIB short names: 'sst' or 'skt' (skin temp) or 'sstk'
-    sst_candidates = [v for v in ds.data_vars
-                      if any(k in v.lower() for k in ["sst", "skt", "skin"])]
-    if not sst_candidates:
-        raise RuntimeError(f"No SST variable found in {grib_path}. "
-                           f"Available: {list(ds.data_vars)}")
-    sst_var = sst_candidates[0]
-    sst = ds[sst_var]
-
-    # Spatial average over the Niño 3.4 box
-    # The 'step' dimension represents lead time (months ahead)
-    clim_by_lead = {}
-    for i, step_val in enumerate(sst.step.values):
-        lead_month = i + 1   # 1-based lead month index
-        sst_step = sst.isel(step=i)
-        # Average over latitude and longitude
-        spatial_mean = float(_area_mean(sst_step).values)
-        clim_by_lead[lead_month] = spatial_mean
-
-    print(f"[PROCESS]   Climatology lead months: {list(clim_by_lead.keys())}")
-    return clim_by_lead
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# C3S FORECAST ENSEMBLE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_forecast_ensemble(grib_path: str,
-                            hindcast_clim: dict,
-                            init_year: int) -> xr.DataArray:
-    """
-    Load C3S forecast ensemble members from a GRIB file and return a DataArray
-    of daily Niño 3.4 *anomaly* trajectories for each member.
-
-    The anomaly is computed by subtracting the model's hindcast climatological
-    mean for the appropriate target month. This removes the model's systematic
-    bias before we pool members from different models into a grand ensemble.
+    Note: using ERA5 as the reference rather than a per-model hindcast mean
+    means the anomaly includes each model's warm/cold bias. This inflates the
+    ensemble spread slightly, but for a first version it is acceptable. Per-
+    model debiasing can be added later if hindcast data becomes accessible.
 
     Parameters
     ----------
-    grib_path      : path to the forecast GRIB file
-    hindcast_clim  : dict from load_hindcast_climatology(), keyed by lead month
-    init_year      : initialisation year (needed to compute actual dates)
+    grib_path    : path to the monthly-mean forecast GRIB file
+    era5_anomaly : ERA5 Niño 3.4 anomaly time series (from compute_era5_anomaly)
+    init_year    : forecast initialisation year
 
     Returns
     -------
-    xr.DataArray with dimensions ('member', 'time'), values in °C-equivalent
-    anomaly units. The 'time' coordinate holds actual calendar dates.
+    xr.DataArray with dimensions ('member', 'month'), where 'month' holds the
+    actual calendar month number (e.g. [4, 5, 6] for AMJ).
     """
-    print(f"[PROCESS] Loading forecast ensemble from {grib_path} …")
+    print(f"[PROCESS] Loading monthly forecast ensemble from {grib_path} …")
 
     datasets = cfgrib.open_datasets(grib_path, squeeze=False)
     if not datasets:
@@ -233,59 +182,76 @@ def load_forecast_ensemble(grib_path: str,
                            f"Available: {list(ds.data_vars)}")
     sst = ds[sst_candidates[0]]
 
-    # Spatial average → shape (member, step) where step is lead time in hours
+    # Spatial average over the Niño 3.4 box
     sst_spatial = _area_mean(sst)
 
-    # Convert the 'step' coordinate (lead-time offsets) to actual calendar dates.
-    # The initialisation date is always the 1st of INIT_MONTH.
-    init_date = date(init_year, config.INIT_MONTH, 1)
-    actual_dates = pd.to_datetime([
-        init_date + timedelta(hours=int(s / np.timedelta64(1, 'h')))
-        for s in sst_spatial.step.values
-    ])
+    # The 'step' dimension here is a monthly lead time offset (e.g. 1 month, 2 months…)
+    # Convert to actual calendar months
+    target_months = config.TARGET_MONTHS
+    n_leads = len(sst_spatial.step.values)
 
-    # Determine which lead-month index (1-based) each date belongs to,
-    # so we can subtract the right climatological monthly mean.
-    # lead_month 1 = same month as INIT_MONTH, 2 = next month, etc.
-    target_month_list = config.TARGET_MONTHS  # e.g. [4, 5, 6]
+    # Build ERA5 monthly climatology for debiasing:
+    # For each target month, compute the mean ERA5 anomaly over the hindcast period.
+    # Since era5_anomaly is already anomaly (mean removed), its climatological mean
+    # over the hindcast period is ~0 by construction. So we debias against ERA5
+    # absolute SST climatology instead.
+    #
+    # Practical approach: compute ERA5 monthly mean over the hindcast years for
+    # each target month, then subtract from the model forecast.
+    # Compute ERA5 raw SST monthly climatology over the hindcast period.
+    # We use the RAW SST (in Kelvin) so that subtracting it from the model's
+    # raw SST forecast gives a proper anomaly in the same reference frame as
+    # the ERA5 regression (which operates on ERA5 anomalies).
+    era5_raw_monthly_clim = {}
+    for cal_month in target_months:
+        vals = []
+        for yr in range(config.HINDCAST_START_YEAR, config.HINDCAST_END_YEAR + 1):
+            era5_month = era5_raw.sel(
+                time=(
+                    (era5_raw.time.dt.year  == yr) &
+                    (era5_raw.time.dt.month == cal_month)
+                )
+            )
+            if len(era5_month) > 0:
+                vals.append(float(era5_month.mean()))
+        era5_raw_monthly_clim[cal_month] = float(np.mean(vals)) if vals else 0.0
+        print(f"[PROCESS]   ERA5 SST climatology {cal_month:02d}: "
+              f"{era5_raw_monthly_clim[cal_month]:.2f} K")
 
-    # Build anomaly array: for each timestep subtract the climatological mean
-    # of the corresponding target month.
-    sst_values = sst_spatial.values  # shape: (member, time)
+    # Extract member values and convert lead index → calendar month
+    sst_values = sst_spatial.values   # shape: (member, step) or (step,) if 1 member
 
-    # Make sure we have a 'number' dimension (ensemble member axis)
-    if "number" not in sst_spatial.dims:
-        # If only one member, add a dimension
-        sst_values = sst_values[np.newaxis, :]
-        n_members = 1
-    else:
-        n_members = sst_values.shape[sst_spatial.dims.index("number")]
+    if sst_values.ndim == 1:
+        sst_values = sst_values[np.newaxis, :]   # add member axis
 
-    anomaly_values = sst_values.copy()
-    for t_idx, dt in enumerate(actual_dates):
-        cal_month = dt.month
-        # Find which lead-month index this calendar month corresponds to
-        if cal_month in target_month_list:
-            lm_index = target_month_list.index(cal_month) + 1  # 1-based
-            if lm_index in hindcast_clim:
-                # Subtract model climatology for this lead month from all members
-                anomaly_values[:, t_idx] -= hindcast_clim[lm_index]
+    n_members, n_steps = sst_values.shape
 
-    # Build output DataArray with clear dimension names
-    member_dim = np.arange(n_members)
+    # Build output: one value per member per calendar month
+    month_labels = []
+    anomaly_cols = []
+
+    for step_idx in range(min(n_steps, len(target_months))):
+        cal_month = target_months[step_idx]
+        month_labels.append(cal_month)
+
+        # Debias: subtract ERA5 climatological monthly mean of anomaly (≈0)
+        col = sst_values[:, step_idx] - era5_raw_monthly_clim[cal_month]
+        anomaly_cols.append(col)
+
+    anomaly_array = np.column_stack(anomaly_cols)   # shape: (member, n_months)
+
     result = xr.DataArray(
-        anomaly_values,
-        dims=["member", "time"],
-        coords={"member": member_dim, "time": actual_dates},
+        anomaly_array,
+        dims=["member", "month"],
+        coords={
+            "member": np.arange(n_members),
+            "month":  month_labels,
+        },
     )
-    result.attrs["units"] = "K (anomaly)"
+    result.attrs["units"] = "K (anomaly relative to ERA5 climatology)"
 
-    # Keep only dates that fall within the target season months
-    mask = np.isin(actual_dates.month, config.TARGET_MONTHS)
-    result = result.isel(time=mask)
-
-    print(f"[PROCESS]   Ensemble shape: {result.shape}  "
-          f"({n_members} members × {result.sizes['time']} days)")
+    print(f"[PROCESS]   Monthly ensemble shape: {result.shape}  "
+          f"({n_members} members × {len(month_labels)} months)")
     return result
 
 
@@ -320,8 +286,7 @@ def build_grand_ensemble(model_ensembles: dict) -> xr.DataArray:
     if not all_members:
         raise RuntimeError("No model ensembles available — all downloads failed.")
 
-    # Align on the time axis before concatenating (models may have slightly
-    # different date ranges due to different calendar conventions)
+    # Align on the month axis before concatenating
     combined = xr.concat(all_members, dim="member")
 
     # Store which model each member came from as metadata

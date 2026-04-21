@@ -85,17 +85,10 @@ def main():
         # Build the expected file path dict without downloading
         file_paths = {
             "era5": os.path.join(config.ERA5_DIR, "era5_sst_nino34.nc"),
-            "hindcast_clim": {
-                name: os.path.join(
-                    config.HINDCAST_DIR,
-                    f"hindcast_clim_{name}_m{config.INIT_MONTH:02d}.grib",
-                )
-                for name in config.MODELS
-            },
             "forecast": {
                 name: os.path.join(
                     config.FORECAST_DIR,
-                    f"forecast_{name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
+                    f"forecast_monthly_{name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
                 )
                 for name in config.MODELS
             },
@@ -112,23 +105,20 @@ def main():
     )
 
     # ── STEP 3: C3S ensemble ─────────────────────────────────────────────────
-    print("\n[STEP 3] Loading C3S forecast ensemble and debiasing per model …")
+    print("\n[STEP 3] Loading C3S monthly forecast ensemble …")
 
     model_ensembles = {}
     for model_name in config.MODELS:
-        hc_path = file_paths["hindcast_clim"].get(model_name)
         fc_path = file_paths["forecast"].get(model_name)
 
-        if not hc_path or not os.path.exists(hc_path):
-            print(f"  [SKIP] {model_name}: hindcast climatology file not found.")
-            continue
         if not fc_path or not os.path.exists(fc_path):
             print(f"  [SKIP] {model_name}: forecast file not found.")
             continue
 
         try:
-            hindcast_clim = process.load_hindcast_climatology(hc_path)
-            ensemble_da   = process.load_forecast_ensemble(fc_path, hindcast_clim, init_year)
+            ensemble_da = process.load_forecast_ensemble_monthly(
+                fc_path, era5_raw, init_year
+            )
             model_ensembles[model_name] = ensemble_da
         except Exception as exc:
             print(f"  [SKIP] {model_name}: error during processing — {exc}")
@@ -154,8 +144,8 @@ def main():
         hindcast_end=config.HINDCAST_END_YEAR,
     )
 
-    # Prior distribution from C3S ensemble
-    prior = bayesian_update.compute_prior(grand_ensemble, config.TARGET_MONTHS)
+    # Prior distribution from C3S ensemble (monthly data — mean over all months)
+    prior = bayesian_update.compute_prior_monthly(grand_ensemble)
 
     # Observed partial-month running mean from ERA5
     obs_partial = era5_anomaly.sel(
@@ -201,6 +191,7 @@ def main():
         grand_ensemble,
         init_year=init_year,
         max_cutoff_day=cutoff_day,
+        monthly=True,
     )
 
     # ── STEP 8: Save figures ─────────────────────────────────────────────────
@@ -215,7 +206,7 @@ def main():
         f"tercile_evolution_{config.SEASON_LABEL}_{init_year}_cutoff{cutoff_day:02d}.png",
     )
 
-    visualize.plot_updated_plume(
+    visualize.plot_updated_plume_monthly(
         ensemble=grand_ensemble,
         era5_obs=era5_anomaly,
         prior=prior,

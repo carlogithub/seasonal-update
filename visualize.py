@@ -158,6 +158,100 @@ def plot_updated_plume(ensemble: xr.DataArray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIGURE 1b — MONTHLY PLUME (when daily data is unavailable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_updated_plume_monthly(ensemble,
+                                era5_obs,
+                                prior,
+                                posterior,
+                                cutoff_date,
+                                init_year: int,
+                                save_path=None) -> None:
+    """
+    Bar-chart version of the plume for monthly ensemble data.
+
+    Shows prior and posterior ensemble distributions as box-whisker plots for
+    each target month, with the ERA5 observed monthly mean overlaid as a marker.
+    """
+    import calendar
+
+    target_months = ensemble.month.values
+    month_names   = [calendar.month_abbr[m] for m in target_months]
+    x             = np.arange(len(target_months))
+    width         = 0.35
+
+    ens_values = ensemble.values   # (member, month)
+    scale = posterior.std / prior.std if prior.std > 0 else 1.0
+    ens_post = posterior.mean + (ens_values - prior.mean) * scale
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    for i, (cal_month, mname) in enumerate(zip(target_months, month_names)):
+        prior_col  = ens_values[:, i]
+        post_col   = ens_post[:, i]
+
+        # Prior box (left of centre)
+        bp1 = ax.boxplot(prior_col, positions=[x[i] - width/2], widths=width*0.8,
+                         patch_artist=True, manage_ticks=False,
+                         boxprops=dict(facecolor=COLOUR_PRIOR, alpha=0.5),
+                         medianprops=dict(color=COLOUR_PRIOR, linewidth=2),
+                         whiskerprops=dict(color=COLOUR_PRIOR),
+                         capprops=dict(color=COLOUR_PRIOR),
+                         flierprops=dict(marker=".", color=COLOUR_PRIOR, alpha=0.3))
+
+        # Posterior box (right of centre)
+        bp2 = ax.boxplot(post_col, positions=[x[i] + width/2], widths=width*0.8,
+                         patch_artist=True, manage_ticks=False,
+                         boxprops=dict(facecolor=COLOUR_POSTERIOR, alpha=0.5),
+                         medianprops=dict(color=COLOUR_POSTERIOR, linewidth=2),
+                         whiskerprops=dict(color=COLOUR_POSTERIOR),
+                         capprops=dict(color=COLOUR_POSTERIOR),
+                         flierprops=dict(marker=".", color=COLOUR_POSTERIOR, alpha=0.3))
+
+        # ERA5 observation for this month (if before cutoff)
+        cutoff_ts = pd.Timestamp(cutoff_date)
+        if pd.Timestamp(year=init_year, month=cal_month, day=1) <= cutoff_ts:
+            obs_month = era5_obs.sel(
+                time=(
+                    (era5_obs.time.dt.year  == init_year) &
+                    (era5_obs.time.dt.month == cal_month)
+                )
+            )
+            if len(obs_month) > 0:
+                obs_val = float(obs_month.mean())
+                ax.plot(x[i], obs_val, marker="D", color=COLOUR_OBS,
+                        markersize=10, zorder=5, label="ERA5 obs" if i == 0 else "")
+
+    ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(month_names, fontsize=11)
+    ax.set_ylabel("Niño 3.4 anomaly (K)", fontsize=11)
+    ax.set_title(
+        f"C3S multi-model Niño 3.4 forecast — {config.SEASON_LABEL} {init_year}\n"
+        f"Prior (blue) vs posterior (orange) updated to {cutoff_date.strftime('%d %b %Y')}",
+        fontsize=12,
+    )
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=COLOUR_PRIOR,     alpha=0.5, label="Prior (C3S ensemble)"),
+        Patch(facecolor=COLOUR_POSTERIOR, alpha=0.5, label="Posterior (updated)"),
+        plt.Line2D([0], [0], marker="D", color=COLOUR_OBS, linestyle="None",
+                   markersize=8, label="ERA5 observed"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper left", fontsize=9)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"[PLOT] Monthly plume figure saved to {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FIGURE 2 — TERCILE PROBABILITY EVOLUTION
 # ─────────────────────────────────────────────────────────────────────────────
 

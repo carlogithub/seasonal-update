@@ -81,112 +81,53 @@ def download_era5_sst(start_year: int, end_year: int) -> str:
         zip_path,
     )
 
-    # CDS wraps the NetCDF in a ZIP archive — unpack it
-    print("[ERA5] Unzipping …")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        # The archive should contain exactly one .nc file
-        nc_names = [n for n in zf.namelist() if n.endswith(".nc")]
-        if not nc_names:
-            raise RuntimeError("ERA5 ZIP contains no .nc file")
-        zf.extract(nc_names[0], config.ERA5_DIR)
-        extracted = os.path.join(config.ERA5_DIR, nc_names[0])
-
-    # Rename to our canonical filename
-    os.rename(extracted, nc_path)
-    os.remove(zip_path)
+    # CDS sometimes delivers a ZIP archive containing a NetCDF, and sometimes
+    # delivers a plain NetCDF directly — handle both cases.
+    if zipfile.is_zipfile(zip_path):
+        print("[ERA5] Unzipping …")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            nc_names = [n for n in zf.namelist() if n.endswith(".nc")]
+            if not nc_names:
+                raise RuntimeError("ERA5 ZIP contains no .nc file")
+            zf.extract(nc_names[0], config.ERA5_DIR)
+            extracted = os.path.join(config.ERA5_DIR, nc_names[0])
+        os.rename(extracted, nc_path)
+        os.remove(zip_path)
+    else:
+        # Already a plain NetCDF — just rename it
+        print("[ERA5] File is plain NetCDF (no unzip needed).")
+        os.rename(zip_path, nc_path)
 
     print(f"[ERA5] Saved to {nc_path}")
     return nc_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C3S HINDCAST CLIMATOLOGICAL MEAN  (seasonal-monthly-single-levels)
+# C3S FORECAST ENSEMBLE MEMBERS  (seasonal-monthly-single-levels)
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: We use seasonal-monthly-single-levels (monthly_mean product) rather
+# than seasonal-original-single-levels (daily members) because the latter
+# carries a MARS AccessError for all operational forecast years — individual
+# raw model contributions are restricted under C3S data policy.
+# Monthly aggregated data (monthly_mean) is publicly available.
+# Consequence: we lose the daily plume and work at monthly resolution.
+# The Bayesian update and tercile probabilities are unaffected.
+# Per-model debiasing uses ERA5 climatology as the reference (see process.py).
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_hindcast_climatology(model_name: str) -> str | None:
+def download_forecast_monthly(model_name: str, init_year: int) -> str | None:
     """
-    Download the hindcast climatological mean for one C3S model.
+    Download monthly-mean individual member SST forecasts for one C3S model.
 
-    The 'hindcast_climate_mean' product type in seasonal-monthly-single-levels
-    gives the ensemble-mean forecast averaged over all hindcast years (1993–2016).
-    This is the model's "average behaviour" for a given initialisation month and
-    lead time — i.e. its climatology. We subtract it from each forecast member
-    to obtain the forecast anomaly, removing per-model systematic biases before
-    pooling all models together.
-
-    Data are returned at monthly resolution for the target-season lead months.
-
-    Parameters
-    ----------
-    model_name : key in config.MODELS (e.g. 'ecmwf')
-
-    Returns
-    -------
-    Path to the GRIB file, or None if the download failed.
-    """
-    model = config.MODELS[model_name]
-
-    out_path = os.path.join(
-        config.HINDCAST_DIR,
-        f"hindcast_clim_{model_name}_m{config.INIT_MONTH:02d}.grib",
-    )
-
-    if os.path.exists(out_path):
-        print(f"[HINDCAST CLIM] Already downloaded: {out_path}")
-        return out_path
-
-    print(f"[HINDCAST CLIM] Downloading climatology for {model_name} …")
-
-    # Lead months: how many months after the initialisation month do we cover?
-    # For an April init targeting AMJ: lead month 1 = April, 2 = May, 3 = June
-    n_target = len(config.TARGET_MONTHS)
-    leadtime_months = [str(lm) for lm in range(1, n_target + 1)]
-
-    try:
-        c = _cds_client()
-        c.retrieve(
-            "seasonal-monthly-single-levels",
-            {
-                "format": "grib",
-                "originating_centre": model["originating_centre"],
-                "system": model["system"],
-                "variable": "sea_surface_temperature",
-                "product_type": "hindcast_climate_mean",
-                # Initialisation month (day is always '01' for seasonal forecasts)
-                "month": str(config.INIT_MONTH).zfill(2),
-                "leadtime_month": leadtime_months,
-                "area": config.NINO34_AREA,
-            },
-            out_path,
-        )
-        print(f"[HINDCAST CLIM] Saved to {out_path}")
-        return out_path
-
-    except Exception as exc:
-        print(f"[HINDCAST CLIM] WARNING: {model_name} failed — {exc}")
-        print(f"[HINDCAST CLIM]   This model will be skipped.")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# C3S FORECAST ENSEMBLE MEMBERS  (seasonal-original-single-levels)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def download_forecast_members(model_name: str, init_year: int) -> str | None:
-    """
-    Download all ensemble members of a C3S seasonal forecast at daily resolution.
-
-    'seasonal-original-single-levels' provides the raw model output before any
-    post-processing. We request all ensemble members so we can reconstruct the
-    full probability distribution (plume) of daily Niño 3.4 trajectories.
-
-    Lead times are expressed as hours from the initialisation date (day 1 = 24 h,
-    day 2 = 48 h, …). We cover the full target season plus a small buffer.
+    Uses seasonal-monthly-single-levels with product_type='monthly_mean', which
+    returns the per-member monthly mean SST for each lead month. This gives us
+    the ensemble distribution at monthly resolution — enough to build the prior
+    and compute tercile probabilities.
 
     Parameters
     ----------
     model_name : key in config.MODELS
-    init_year  : the forecast initialisation year (e.g. 2026)
+    init_year  : forecast initialisation year (e.g. 2026)
 
     Returns
     -------
@@ -196,40 +137,32 @@ def download_forecast_members(model_name: str, init_year: int) -> str | None:
 
     out_path = os.path.join(
         config.FORECAST_DIR,
-        f"forecast_{model_name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
+        f"forecast_monthly_{model_name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
     )
 
     if os.path.exists(out_path):
         print(f"[FORECAST] Already downloaded: {out_path}")
         return out_path
 
-    print(f"[FORECAST] Downloading {model_name} {init_year}-{config.INIT_MONTH:02d} …")
+    print(f"[FORECAST] Downloading monthly members for {model_name} {init_year}-{config.INIT_MONTH:02d} …")
 
-    # Build the list of lead-time hours: one value per day, starting at 24 h
-    leadtime_hours = [
-        str(h)
-        for h in range(24, (config.FORECAST_LEADTIME_DAYS + 1) * 24, 24)
-    ]
-
-    # Member numbers as strings: '0', '1', …, 'n_members-1'
-    members = [str(n) for n in range(model["n_members"])]
+    n_target = len(config.TARGET_MONTHS)
+    leadtime_months = [str(lm) for lm in range(1, n_target + 1)]
 
     try:
         c = _cds_client()
         c.retrieve(
-            "seasonal-original-single-levels",
+            "seasonal-monthly-single-levels",
             {
-                "format": "grib",
+                "data_format": "grib",
                 "originating_centre": model["originating_centre"],
                 "system": model["system"],
                 "variable": "sea_surface_temperature",
-                "product_type": "forecast",
+                "product_type": "monthly_mean",
                 "year":  str(init_year),
                 "month": str(config.INIT_MONTH).zfill(2),
-                "day":   "01",
-                "leadtime_hour": leadtime_hours,
-                "number": members,
-                "area":  config.NINO34_AREA,
+                "leadtime_month": leadtime_months,
+                "area": config.NINO34_AREA,
             },
             out_path,
         )
@@ -265,9 +198,8 @@ def download_all(init_year: int) -> dict:
         init_year,
     )
 
-    # Per-model hindcast climatology and forecast ensemble
+    # Per-model monthly forecast ensemble (hindcast climatology now derived from ERA5)
     for model_name in config.MODELS:
-        results["hindcast_clim"][model_name] = download_hindcast_climatology(model_name)
-        results["forecast"][model_name]      = download_forecast_members(model_name, init_year)
+        results["forecast"][model_name] = download_forecast_monthly(model_name, init_year)
 
     return results

@@ -168,6 +168,21 @@ def fit_era5_regression(era5_anomaly: xr.DataArray,
 # STEP 2 — GAUSSIAN PRIOR FROM ENSEMBLE
 # ─────────────────────────────────────────────────────────────────────────────
 
+def compute_prior_monthly(ensemble: xr.DataArray) -> GaussianDist:
+    """
+    Derive the Gaussian prior from a monthly ensemble DataArray (member × month).
+
+    Takes the mean across all target months for each member, then fits a Gaussian
+    to the resulting distribution of seasonal means.
+    """
+    seasonal_means = ensemble.mean(dim="month").values   # shape: (member,)
+    mu    = float(np.mean(seasonal_means))
+    sigma = float(np.std(seasonal_means, ddof=1))
+    print(f"[BAYES] Prior (C3S monthly ensemble): μ={mu:.3f} K, σ={sigma:.3f} K, "
+          f"n_members={len(seasonal_means)}")
+    return GaussianDist(mean=mu, std=sigma)
+
+
 def compute_prior(ensemble: xr.DataArray,
                    target_months: List[int]) -> GaussianDist:
     """
@@ -326,7 +341,8 @@ def compute_tercile_probs(posterior: GaussianDist,
 def compute_probability_evolution(era5_anomaly: xr.DataArray,
                                    ensemble: xr.DataArray,
                                    init_year: int,
-                                   max_cutoff_day: int) -> pd.DataFrame:
+                                   max_cutoff_day: int,
+                                   monthly: bool = False) -> pd.DataFrame:
     """
     Repeat the Bayesian update for cutoff days 1, 2, …, max_cutoff_day and
     record how the tercile probabilities evolve as more observations accumulate.
@@ -348,7 +364,7 @@ def compute_probability_evolution(era5_anomaly: xr.DataArray,
       prob_below, prob_normal, prob_above
     """
     # Compute prior and thresholds once (they don't change with cutoff day)
-    prior = compute_prior(ensemble, config.TARGET_MONTHS)
+    prior = compute_prior_monthly(ensemble) if monthly else compute_prior(ensemble, config.TARGET_MONTHS)
     t_lower, t_upper = compute_tercile_thresholds(
         era5_anomaly,
         config.TARGET_MONTHS,
