@@ -1,0 +1,8 @@
+cdsapi
+cfgrib
+eccodes
+xarray
+numpy
+scipy
+matplotlib
+pandas
