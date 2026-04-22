@@ -1,88 +1,88 @@
 """
-download.py — CDS API download functions for ERA5 and C3S seasonal forecasts.
+download.py — CDS API downloads for ERA5 and C3S seasonal forecasts.
 
-Three types of data are needed:
-  1. ERA5 SST (historical reanalysis) — used as proxy observations and to
-     build the regression that links partial-month observations to seasonal outcomes.
-  2. C3S hindcast climatological mean (per model) — used to debias each model's
-     forecast by subtracting its own systematic average behaviour.
-  3. C3S forecast ensemble members (daily) — the actual ensemble plume for the
-     current season, which forms our probabilistic prior.
+All functions are generic: they take Location, Variable, and Season objects.
 
-Files are cached on disk: if the output path already exists the download is
-skipped, so re-running the script is cheap.
+File naming convention
+----------------------
+ERA5:              era5_{variable.slug}_{location.slug}.nc
+Postproc forecast: forecast_postproc_{model}_{location.slug}_{variable.slug}
+                       _{init_year}_m{init_month:02d}.grib
+Monthly forecast:  forecast_monthly_{model}_{location.slug}_{variable.slug}
+                       _{init_year}_m{init_month:02d}.grib
+Hindcast clim:     hindcast_monthly_{model}_{location.slug}_{variable.slug}
+                       _m{init_month:02d}.grib
+
+Debiasing approach
+------------------
+Primary path: seasonal-postprocessed-single-levels delivers bias-corrected
+anomalies directly.  No separate hindcast download needed.
+
+Fallback (if the primary path fails, e.g. for models not yet in the
+postprocessed dataset): download monthly_mean + multi-year hindcast and
+subtract the model's own climatological mean in process.py.
 """
 
 import os
 import zipfile
 import cdsapi
 import config
+from location import Location
+from variable import Variable
+from season   import Season
 
 
 def _cds_client():
-    """Return a CDS API client. Reads credentials from ~/.cdsapirc automatically."""
     return cdsapi.Client()
+
+
+def _ensure_dirs():
+    for d in [config.DATA_DIR, config.ERA5_DIR, config.FORECAST_DIR, config.OUTPUT_DIR]:
+        os.makedirs(d, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ERA5
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_era5_sst(start_year: int, end_year: int) -> str:
+def download_era5(location: Location, variable: Variable, season: Season,
+                  start_year: int, end_year: int) -> str:
     """
-    Download ERA5 daily sea-surface temperature over the Niño 3.4 box for
-    every April, May, and June from start_year to end_year (inclusive).
+    Download ERA5 for a location+variable, all 12 months, start_year to end_year+1.
 
-    We request one snapshot per day at 12:00 UTC. SST is a slowly-varying
-    boundary condition in ERA5, so a single daily snapshot is a good proxy
-    for the daily mean.
-
-    CDS delivers ERA5 as a ZIP archive containing a NetCDF file. The function
-    unzips it and returns the path to the NetCDF.
-
-    Parameters
-    ----------
-    start_year : first year of the historical period (e.g. 1993)
-    end_year   : last year of the historical period (e.g. 2026)
-
-    Returns
-    -------
-    Path to the unzipped NetCDF file.
+    All months are downloaded so one file covers both JJA and DJF seasons.
+    end_year+1 ensures DJF Jan/Feb of the final forecast year are present.
+    CDS delivers ERA5 as plain NetCDF or ZIP — both handled.
     """
-    nc_path  = os.path.join(config.ERA5_DIR, "era5_sst_nino34.nc")
-    zip_path = nc_path.replace(".nc", ".zip")
+    _ensure_dirs()
 
-    # Skip if already downloaded
+    nc_path  = os.path.join(config.ERA5_DIR, f"era5_{variable.slug}_{location.slug}.nc")
+    zip_path = nc_path.replace(".nc", "_download.tmp")
+
     if os.path.exists(nc_path):
         print(f"[ERA5] Already downloaded: {nc_path}")
         return nc_path
 
-    print(f"[ERA5] Downloading SST for {start_year}–{end_year}, months "
-          f"{config.TARGET_MONTHS} …")
+    all_years = list(range(start_year, end_year + 2))
+    print(f"[ERA5] Downloading {variable.name} for {location.name}, "
+          f"all months, years {start_year}–{all_years[-1]} …")
 
     c = _cds_client()
     c.retrieve(
         "reanalysis-era5-single-levels",
         {
             "product_type": "reanalysis",
-            "variable": "sea_surface_temperature",
-            # All years in the requested range
-            "year":  [str(y) for y in range(start_year, end_year + 1)],
-            # Only the target-season months (AMJ by default)
-            "month": [str(m).zfill(2) for m in config.TARGET_MONTHS],
-            # All calendar days (CDS ignores day 31 for short months)
-            "day":   [str(d).zfill(2) for d in range(1, 32)],
-            # One snapshot per day at midday
-            "time":  "12:00",
-            # Spatial subsetting to the Niño 3.4 box — keeps the file small
-            "area":  config.NINO34_AREA,
-            "format": "netcdf",
+            "variable":     variable.era5_name,
+            "year":         [str(y) for y in all_years],
+            "month":        [str(m).zfill(2) for m in range(1, 13)],
+            "day":          [str(d).zfill(2) for d in range(1, 32)],
+            "time":         "12:00",
+            "area":         location.cds_area,
+            "data_format":  "netcdf",
         },
         zip_path,
     )
 
-    # CDS sometimes delivers a ZIP archive containing a NetCDF, and sometimes
-    # delivers a plain NetCDF directly — handle both cases.
     if zipfile.is_zipfile(zip_path):
         print("[ERA5] Unzipping …")
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -90,11 +90,9 @@ def download_era5_sst(start_year: int, end_year: int) -> str:
             if not nc_names:
                 raise RuntimeError("ERA5 ZIP contains no .nc file")
             zf.extract(nc_names[0], config.ERA5_DIR)
-            extracted = os.path.join(config.ERA5_DIR, nc_names[0])
-        os.rename(extracted, nc_path)
+            os.rename(os.path.join(config.ERA5_DIR, nc_names[0]), nc_path)
         os.remove(zip_path)
     else:
-        # Already a plain NetCDF — just rename it
         print("[ERA5] File is plain NetCDF (no unzip needed).")
         os.rename(zip_path, nc_path)
 
@@ -103,66 +101,49 @@ def download_era5_sst(start_year: int, end_year: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# C3S FORECAST ENSEMBLE MEMBERS  (seasonal-monthly-single-levels)
-# ─────────────────────────────────────────────────────────────────────────────
-# NOTE: We use seasonal-monthly-single-levels (monthly_mean product) rather
-# than seasonal-original-single-levels (daily members) because the latter
-# carries a MARS AccessError for all operational forecast years — individual
-# raw model contributions are restricted under C3S data policy.
-# Monthly aggregated data (monthly_mean) is publicly available.
-# Consequence: we lose the daily plume and work at monthly resolution.
-# The Bayesian update and tercile probabilities are unaffected.
-# Per-model debiasing uses ERA5 climatology as the reference (see process.py).
+# C3S MONTHLY FORECAST ENSEMBLE  (monthly_mean)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_forecast_monthly(model_name: str, init_year: int) -> str | None:
+def download_forecast_monthly(location: Location, variable: Variable,
+                               season: Season, model_name: str,
+                               init_year: int) -> str | None:
     """
-    Download monthly-mean individual member SST forecasts for one C3S model.
+    Download C3S per-member monthly-mean forecast for one model.
 
-    Uses seasonal-monthly-single-levels with product_type='monthly_mean', which
-    returns the per-member monthly mean SST for each lead month. This gives us
-    the ensemble distribution at monthly resolution — enough to build the prior
-    and compute tercile probabilities.
-
-    Parameters
-    ----------
-    model_name : key in config.MODELS
-    init_year  : forecast initialisation year (e.g. 2026)
-
-    Returns
-    -------
-    Path to the GRIB file, or None if the download failed.
+    Uses product_type='monthly_mean'.  Raw values are in absolute units
+    (Kelvin for T/SST, m or m/s for TP).  Debiasing is done in process.py
+    by subtracting the hindcast climatological mean downloaded separately.
     """
-    model = config.MODELS[model_name]
+    _ensure_dirs()
 
+    model    = config.MODELS[model_name]
     out_path = os.path.join(
         config.FORECAST_DIR,
-        f"forecast_monthly_{model_name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
+        f"forecast_monthly_{model_name}_{location.slug}_{variable.slug}"
+        f"_{init_year}_m{season.init_month:02d}.grib",
     )
 
     if os.path.exists(out_path):
         print(f"[FORECAST] Already downloaded: {out_path}")
         return out_path
 
-    print(f"[FORECAST] Downloading monthly members for {model_name} {init_year}-{config.INIT_MONTH:02d} …")
-
-    n_target = len(config.TARGET_MONTHS)
-    leadtime_months = [str(lm) for lm in range(1, n_target + 1)]
+    print(f"[FORECAST] Downloading {variable.name} for {location.name} — "
+          f"{model_name} {init_year}-{season.init_month:02d} …")
 
     try:
         c = _cds_client()
         c.retrieve(
             "seasonal-monthly-single-levels",
             {
-                "data_format": "grib",
+                "data_format":        "grib",
                 "originating_centre": model["originating_centre"],
-                "system": model["system"],
-                "variable": "sea_surface_temperature",
-                "product_type": "monthly_mean",
-                "year":  str(init_year),
-                "month": str(config.INIT_MONTH).zfill(2),
-                "leadtime_month": leadtime_months,
-                "area": config.NINO34_AREA,
+                "system":             model["system"],
+                "variable":           variable.c3s_name,
+                "product_type":       "monthly_mean",
+                "year":               str(init_year),
+                "month":              str(season.init_month).zfill(2),
+                "leadtime_month":     [str(lm) for lm in season.leadtime_months()],
+                "area":               location.cds_area,
             },
             out_path,
         )
@@ -176,30 +157,173 @@ def download_forecast_monthly(model_name: str, init_year: int) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONVENIENCE: download everything for one run
+# C3S POST-PROCESSED FORECAST  (bias-corrected anomalies — preferred path)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_all(init_year: int) -> dict:
+def download_forecast_postprocessed(location: Location, variable: Variable,
+                                     season: Season, model_name: str,
+                                     init_year: int) -> str | None:
     """
-    Download ERA5, hindcast climatologies, and forecast ensembles for all models.
+    Download from seasonal-postprocessed-single-levels (bias-corrected anomalies).
 
-    Returns a dict with keys 'era5', 'hindcast_clim', 'forecast' whose values
-    are file paths (or None where a model download failed).
+    This dataset delivers pre-debiased anomalies directly, eliminating the need
+    for separate hindcast downloads and manual debiasing.  Available for years
+    2017+ only; covers all major C3S models including ECMWF system=51.
+
+    Returns None if the variable has no postprocessed CDS name or the download fails.
     """
-    results = {
-        "era5": None,
-        "hindcast_clim": {},
-        "forecast": {},
-    }
+    if not variable.c3s_postproc_name:
+        return None
 
-    # ERA5 — one file covering the full hindcast period + current year
-    results["era5"] = download_era5_sst(
-        config.HINDCAST_START_YEAR,
-        init_year,
+    _ensure_dirs()
+
+    model    = config.MODELS[model_name]
+    out_path = os.path.join(
+        config.FORECAST_DIR,
+        f"forecast_postproc_{model_name}_{location.slug}_{variable.slug}"
+        f"_{init_year}_m{season.init_month:02d}.grib",
     )
 
-    # Per-model monthly forecast ensemble (hindcast climatology now derived from ERA5)
+    if os.path.exists(out_path):
+        print(f"[POSTPROC] Already downloaded: {out_path}")
+        return out_path
+
+    print(f"[POSTPROC] Downloading {variable.name} postprocessed anomaly for "
+          f"{location.name} — {model_name} {init_year}-{season.init_month:02d} …")
+
+    try:
+        c = _cds_client()
+        c.retrieve(
+            "seasonal-postprocessed-single-levels",
+            {
+                "data_format":        "grib",
+                "originating_centre": model["originating_centre"],
+                "system":             model["system"],
+                "variable":           variable.c3s_postproc_name,
+                "product_type":       "monthly_mean",
+                "year":               str(init_year),
+                "month":              str(season.init_month).zfill(2),
+                "leadtime_month":     [str(lm) for lm in season.leadtime_months()],
+                "area":               location.cds_area,
+            },
+            out_path,
+        )
+        print(f"[POSTPROC] Saved to {out_path}")
+        return out_path
+
+    except Exception as exc:
+        print(f"[POSTPROC] WARNING: {model_name} failed — {exc}")
+        print(f"[POSTPROC]   Will fall back to monthly_mean + hindcast debiasing.")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C3S HINDCAST MONTHLY MEANS  (all years, for computing per-model climatology)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_hindcast_monthly(location: Location, variable: Variable,
+                               season: Season, model_name: str) -> str | None:
+    """
+    Download monthly_mean hindcast data for all hindcast years in one request.
+
+    The result is a single GRIB containing all members × all lead months × all
+    hindcast years (1993–2016).  process.py averages over years to derive the
+    model's own climatological mean for each (init_month, lead_month) pair,
+    which is then subtracted from the operational forecast to produce anomalies
+    in the model's own reference frame.
+
+    This approach is used because hindcast_climate_mean (the pre-computed
+    climatology product) is not available for ECMWF SEAS5.1 system=51 via MARS.
+
+    The file is independent of init_year and cached without one in its name.
+    """
+    _ensure_dirs()
+
+    model    = config.MODELS[model_name]
+    out_path = os.path.join(
+        config.FORECAST_DIR,
+        f"hindcast_monthly_{model_name}_{location.slug}_{variable.slug}"
+        f"_m{season.init_month:02d}.grib",
+    )
+
+    if os.path.exists(out_path):
+        print(f"[HINDCAST] Already downloaded: {out_path}")
+        return out_path
+
+    print(f"[HINDCAST] Downloading {variable.name} hindcast (all years) for "
+          f"{location.name} — {model_name} init month {season.init_month:02d} …")
+
+    try:
+        c = _cds_client()
+        c.retrieve(
+            "seasonal-monthly-single-levels",
+            {
+                "data_format":        "grib",
+                "originating_centre": model["originating_centre"],
+                "system":             model["system"],
+                "variable":           variable.c3s_name,
+                "product_type":       "monthly_mean",
+                "year":               [str(y) for y in range(
+                                           config.HINDCAST_START_YEAR,
+                                           config.HINDCAST_END_YEAR + 1)],
+                "month":              str(season.init_month).zfill(2),
+                "leadtime_month":     [str(lm) for lm in season.leadtime_months()],
+                "area":               location.cds_area,
+            },
+            out_path,
+        )
+        print(f"[HINDCAST] Saved to {out_path}")
+        return out_path
+
+    except Exception as exc:
+        print(f"[HINDCAST] WARNING: {model_name} failed — {exc}")
+        print(f"[HINDCAST]   Will fall back to ERA5-based debiasing.")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONVENIENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_all(location: Location, variable: Variable, season: Season,
+                 init_year: int) -> dict:
+    """
+    Download ERA5 and forecast ensembles for all models.
+
+    For each model, try seasonal-postprocessed-single-levels first (delivers
+    bias-corrected anomalies directly).  If that fails, fall back to
+    monthly_mean + multi-year hindcast for manual debiasing in process.py.
+
+    Returns:
+      {
+        "era5":          path_to_nc,
+        "hindcast_clim": { model_name: path_or_None, … },
+        "forecast":      { model_name: path_or_None, … },
+      }
+    Files in "forecast" may be postprocessed (prefix forecast_postproc_) or
+    monthly_mean (prefix forecast_monthly_); process.py detects which by name.
+    """
+    results = {"era5": None, "hindcast_clim": {}, "forecast": {}}
+
+    results["era5"] = download_era5(
+        location, variable, season,
+        start_year=config.HINDCAST_START_YEAR,
+        end_year=init_year,
+    )
+
     for model_name in config.MODELS:
-        results["forecast"][model_name] = download_forecast_monthly(model_name, init_year)
+        postproc_path = download_forecast_postprocessed(
+            location, variable, season, model_name, init_year,
+        )
+        if postproc_path:
+            results["forecast"][model_name]      = postproc_path
+            results["hindcast_clim"][model_name] = None   # not needed
+        else:
+            results["hindcast_clim"][model_name] = download_hindcast_monthly(
+                location, variable, season, model_name,
+            )
+            results["forecast"][model_name] = download_forecast_monthly(
+                location, variable, season, model_name, init_year,
+            )
 
     return results

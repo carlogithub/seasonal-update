@@ -3,26 +3,35 @@ main.py — Orchestrate the seasonal forecast Bayesian update pipeline.
 
 Usage
 -----
-    python main.py --init-year 2026 --cutoff-date 2026-04-21
+    python main.py --location nino34 --variable nino34 --season amj \\
+                   --init-year 2026 --cutoff-date 2026-04-21
+
+    python main.py --location terrassa --variable t2m --season jja \\
+                   --init-year 2026 --cutoff-date 2026-04-21
+
+    python main.py --location terrassa --variable tp --season djf \\
+                   --init-year 2026 --cutoff-date 2026-10-15 \\
+                   --skip-download
 
 Arguments
 ---------
-  --init-year    : year of the forecast initialisation (default: current year)
-  --cutoff-date  : date up to which ERA5 observations are used, format YYYY-MM-DD
-                   (default: today)
-  --skip-download: skip CDS downloads if data files already exist (useful for
-                   re-running the analysis without re-downloading large files)
+  --location     : location key from location.LOCATIONS  (e.g. nino34, terrassa)
+  --variable     : variable key from variable.VARIABLES  (e.g. nino34, t2m, tp)
+  --season       : season key  from season.SEASONS       (e.g. amj, jja, djf)
+  --init-year    : forecast initialisation year (default: current year)
+  --cutoff-date  : ERA5 observation cutoff, YYYY-MM-DD   (default: today)
+  --skip-download: skip CDS downloads if files already exist
 
 Pipeline
 --------
-  1. Download ERA5 SST + C3S hindcast climatologies + C3S forecast ensembles
-  2. Load ERA5, compute Niño 3.4 anomaly time series
+  1. Download ERA5 + C3S monthly forecasts
+  2. Load ERA5, compute anomaly time series
   3. Load per-model C3S data, debias, pool into grand ensemble
-  4. Fit ERA5-based regression for the observed cutoff day
+  4. Fit ERA5-based regression for the observation cutoff day
   5. Compute Gaussian prior from the grand ensemble
-  6. Run Bayesian update → posterior distribution → tercile probabilities
+  6. Run Bayesian update → posterior → tercile probabilities
   7. Compute probability evolution (day 1 to cutoff day)
-  8. Save two figures: updated plume + tercile probability evolution
+  8. Save figures
 """
 
 import argparse
@@ -35,11 +44,36 @@ import process
 import bayesian_update
 import visualize
 
+from location import LOCATIONS
+from variable import VARIABLES
+from season   import SEASONS
+
 
 def parse_args():
     today = date.today()
     parser = argparse.ArgumentParser(
-        description="Bayesian update of C3S seasonal Niño 3.4 forecast with ERA5"
+        description="Bayesian update of C3S seasonal forecast with ERA5 observations"
+    )
+    parser.add_argument(
+        "--location",
+        type=str,
+        default="nino34",
+        choices=list(LOCATIONS.keys()),
+        help=f"Location key: {list(LOCATIONS.keys())}",
+    )
+    parser.add_argument(
+        "--variable",
+        type=str,
+        default="nino34",
+        choices=list(VARIABLES.keys()),
+        help=f"Variable key: {list(VARIABLES.keys())}",
+    )
+    parser.add_argument(
+        "--season",
+        type=str,
+        default="amj",
+        choices=list(SEASONS.keys()),
+        help=f"Season key: {list(SEASONS.keys())}",
     )
     parser.add_argument(
         "--init-year",
@@ -64,42 +98,66 @@ def parse_args():
 def main():
     args = parse_args()
 
+    location    = LOCATIONS[args.location]
+    variable    = VARIABLES[args.variable]
+    season      = SEASONS[args.season]
     init_year   = args.init_year
     cutoff_date = datetime.strptime(args.cutoff_date, "%Y-%m-%d").date()
-    cutoff_day  = cutoff_date.day   # day-of-month, e.g. 21
+    cutoff_day  = cutoff_date.day
 
-    print("=" * 60)
+    print("=" * 65)
     print(f"  Seasonal forecast Bayesian update")
-    print(f"  Initialisation : {init_year}-{config.INIT_MONTH:02d}-01")
-    print(f"  Target season  : {config.SEASON_LABEL}")
-    print(f"  Cutoff date    : {cutoff_date}")
-    print(f"  Cutoff day     : day {cutoff_day} of {config.INIT_MONTH:02d}")
-    print("=" * 60)
+    print(f"  Location       : {location.name}")
+    print(f"  Variable       : {variable.name}")
+    print(f"  Season         : {season.label}  (init month: {season.init_month:02d})")
+    print(f"  Initialisation : {init_year}-{season.init_month:02d}-01")
+    print(f"  Cutoff date    : {cutoff_date}  (day {cutoff_day})")
+    print("=" * 65)
 
     # ── STEP 1: Downloads ────────────────────────────────────────────────────
     if not args.skip_download:
         print("\n[STEP 1] Downloading data from CDS …")
-        file_paths = download.download_all(init_year)
+        file_paths = download.download_all(location, variable, season, init_year)
     else:
         print("\n[STEP 1] Skipping downloads (--skip-download flag set).")
-        # Build the expected file path dict without downloading
-        file_paths = {
-            "era5": os.path.join(config.ERA5_DIR, "era5_sst_nino34.nc"),
-            "forecast": {
-                name: os.path.join(
+        forecast_paths   = {}
+        hindcast_paths   = {}
+        for name in config.MODELS:
+            postproc = os.path.join(
+                config.FORECAST_DIR,
+                f"forecast_postproc_{name}_{location.slug}_{variable.slug}"
+                f"_{init_year}_m{season.init_month:02d}.grib",
+            )
+            monthly = os.path.join(
+                config.FORECAST_DIR,
+                f"forecast_monthly_{name}_{location.slug}_{variable.slug}"
+                f"_{init_year}_m{season.init_month:02d}.grib",
+            )
+            if os.path.exists(postproc):
+                forecast_paths[name]  = postproc
+                hindcast_paths[name]  = None
+            else:
+                forecast_paths[name]  = monthly
+                hindcast_paths[name]  = os.path.join(
                     config.FORECAST_DIR,
-                    f"forecast_monthly_{name}_{init_year}_m{config.INIT_MONTH:02d}.grib",
+                    f"hindcast_monthly_{name}_{location.slug}_{variable.slug}"
+                    f"_m{season.init_month:02d}.grib",
                 )
-                for name in config.MODELS
-            },
+        file_paths = {
+            "era5": os.path.join(
+                config.ERA5_DIR,
+                f"era5_{variable.slug}_{location.slug}.nc",
+            ),
+            "hindcast_clim": hindcast_paths,
+            "forecast":      forecast_paths,
         }
 
-    # ── STEP 2: ERA5 Niño 3.4 anomaly ────────────────────────────────────────
-    print("\n[STEP 2] Computing ERA5 Niño 3.4 anomaly time series …")
+    # ── STEP 2: ERA5 anomaly ─────────────────────────────────────────────────
+    print("\n[STEP 2] Computing ERA5 anomaly time series …")
 
-    era5_raw     = process.load_era5_nino34(file_paths["era5"])
+    era5_raw     = process.load_era5(file_paths["era5"], variable)
     era5_anomaly = process.compute_era5_anomaly(
-        era5_raw,
+        era5_raw, variable, season,
         clim_start=config.HINDCAST_START_YEAR,
         clim_end=config.HINDCAST_END_YEAR,
     )
@@ -110,18 +168,17 @@ def main():
     model_ensembles = {}
     for model_name in config.MODELS:
         fc_path = file_paths["forecast"].get(model_name)
-
         if not fc_path or not os.path.exists(fc_path):
             print(f"  [SKIP] {model_name}: forecast file not found.")
             continue
-
         try:
-            ensemble_da = process.load_forecast_ensemble_monthly(
-                fc_path, era5_raw, init_year
+            hc_path = file_paths["hindcast_clim"].get(model_name)
+            ens_da = process.load_model_forecast(
+                fc_path, hc_path, era5_raw, variable, season,
             )
-            model_ensembles[model_name] = ensemble_da
+            model_ensembles[model_name] = ens_da
         except Exception as exc:
-            print(f"  [SKIP] {model_name}: error during processing — {exc}")
+            print(f"  [SKIP] {model_name}: {exc}")
 
     if not model_ensembles:
         raise RuntimeError(
@@ -131,55 +188,53 @@ def main():
 
     grand_ensemble = process.build_grand_ensemble(model_ensembles)
 
-    # ── STEP 4–6: Bayesian update at the cutoff date ─────────────────────────
+    # ── STEPS 4–6: Bayesian update at the cutoff date ────────────────────────
     print(f"\n[STEP 4–6] Bayesian update for cutoff day {cutoff_day} …")
 
-    # Regression: how informative is partial April obs about full AMJ mean?
     reg = bayesian_update.fit_era5_regression(
-        era5_anomaly,
+        era5_anomaly, variable, season,
         cutoff_day=cutoff_day,
-        init_month=config.INIT_MONTH,
-        target_months=config.TARGET_MONTHS,
         hindcast_start=config.HINDCAST_START_YEAR,
         hindcast_end=config.HINDCAST_END_YEAR,
     )
 
-    # Prior distribution from C3S ensemble (monthly data — mean over all months)
-    prior = bayesian_update.compute_prior_monthly(grand_ensemble)
+    prior = bayesian_update.compute_prior_monthly(grand_ensemble, variable)
 
-    # Observed partial-month running mean from ERA5
+    # Observed partial-month aggregate, transformed
     obs_partial = era5_anomaly.sel(
         time=(
             (era5_anomaly.time.dt.year  == init_year) &
-            (era5_anomaly.time.dt.month == config.INIT_MONTH) &
+            (era5_anomaly.time.dt.month == season.init_month) &
             (era5_anomaly.time.dt.day   <= cutoff_day)
         )
     )
     if len(obs_partial) == 0:
         raise RuntimeError(
-            f"No ERA5 data found for {init_year}-{config.INIT_MONTH:02d} "
-            f"up to day {cutoff_day}. Check that ERA5 covers this period."
+            f"No ERA5 data found for {init_year}-{season.init_month:02d} "
+            f"up to day {cutoff_day}. Check ERA5 coverage."
         )
-    x_obs = float(obs_partial.mean())
-    print(f"  Observed partial-month Niño 3.4 anomaly: {x_obs:.3f} K")
+    x_raw = bayesian_update._aggregate(obs_partial, variable)
+    x_obs = float(variable.apply_transform(x_raw))
+    print(f"  Observed partial-month {variable.short_name}: {x_raw:.4f} → "
+          f"transformed: {x_obs:.4f}")
 
-    # Bayesian posterior
     posterior = bayesian_update.bayesian_update(prior, reg, x_obs)
 
-    # Tercile thresholds and final probabilities
     t_lower, t_upper = bayesian_update.compute_tercile_thresholds(
-        era5_anomaly,
-        config.TARGET_MONTHS,
-        config.HINDCAST_START_YEAR,
-        config.HINDCAST_END_YEAR,
+        era5_anomaly, variable, season,
+        config.HINDCAST_START_YEAR, config.HINDCAST_END_YEAR,
     )
-    probs = bayesian_update.compute_tercile_probs(posterior, t_lower, t_upper)
+    probs       = bayesian_update.compute_tercile_probs(posterior, t_lower, t_upper)
+    prior_probs = bayesian_update.compute_tercile_probs(prior,    t_lower, t_upper)
 
-    print(f"\n  ── Final tercile probabilities for {config.SEASON_LABEL} {init_year} ──")
-    print(f"     Prior  (C3S only)  : BN={bayesian_update.compute_tercile_probs(prior, t_lower, t_upper).below_normal*100:.1f}%  "
-          f"NN={bayesian_update.compute_tercile_probs(prior, t_lower, t_upper).near_normal*100:.1f}%  "
-          f"AN={bayesian_update.compute_tercile_probs(prior, t_lower, t_upper).above_normal*100:.1f}%")
-    print(f"     Posterior (updated): BN={probs.below_normal*100:.1f}%  "
+    print(f"\n  ── Final tercile probabilities for {season.label} {init_year} "
+          f"({location.name} {variable.short_name}) ──")
+    print(f"     Prior  (C3S only)  : "
+          f"BN={prior_probs.below_normal*100:.1f}%  "
+          f"NN={prior_probs.near_normal*100:.1f}%  "
+          f"AN={prior_probs.above_normal*100:.1f}%")
+    print(f"     Posterior (updated): "
+          f"BN={probs.below_normal*100:.1f}%  "
           f"NN={probs.near_normal*100:.1f}%  "
           f"AN={probs.above_normal*100:.1f}%")
 
@@ -187,30 +242,28 @@ def main():
     print(f"\n[STEP 7] Computing probability evolution for days 1–{cutoff_day} …")
 
     evolution_df = bayesian_update.compute_probability_evolution(
-        era5_anomaly,
-        grand_ensemble,
+        era5_anomaly, grand_ensemble, variable, season,
         init_year=init_year,
         max_cutoff_day=cutoff_day,
-        monthly=True,
     )
 
     # ── STEP 8: Save figures ─────────────────────────────────────────────────
     print("\n[STEP 8] Saving figures …")
 
-    plume_path = os.path.join(
-        config.OUTPUT_DIR,
-        f"plume_{config.SEASON_LABEL}_{init_year}_cutoff{cutoff_day:02d}.png",
-    )
-    evol_path = os.path.join(
-        config.OUTPUT_DIR,
-        f"tercile_evolution_{config.SEASON_LABEL}_{init_year}_cutoff{cutoff_day:02d}.png",
-    )
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    tag = f"{season.label}_{location.slug}_{variable.slug}_{init_year}_cutoff{cutoff_day:02d}"
+
+    plume_path = os.path.join(config.OUTPUT_DIR, f"plume_{tag}.png")
+    evol_path  = os.path.join(config.OUTPUT_DIR, f"tercile_evolution_{tag}.png")
 
     visualize.plot_updated_plume_monthly(
         ensemble=grand_ensemble,
         era5_obs=era5_anomaly,
         prior=prior,
         posterior=posterior,
+        variable=variable,
+        season=season,
+        location=location,
         cutoff_date=cutoff_date,
         init_year=init_year,
         save_path=plume_path,
@@ -218,12 +271,15 @@ def main():
 
     visualize.plot_tercile_evolution(
         evolution_df=evolution_df,
+        variable=variable,
+        season=season,
+        location=location,
         init_year=init_year,
         save_path=evol_path,
     )
 
     print("\nDone.")
-    print(f"  Plume figure    → {plume_path}")
+    print(f"  Plume figure     → {plume_path}")
     print(f"  Evolution figure → {evol_path}")
 
 
