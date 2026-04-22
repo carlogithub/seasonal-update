@@ -312,6 +312,22 @@ def main():
         save_path=evol_path,
     )
 
+    if variable.short_name == "nino34":
+        enso_path = os.path.join(config.OUTPUT_DIR, f"enso_prob_{tag}.png")
+        visualize.plot_enso_nino_probability(
+            ensemble=grand_ensemble,
+            prior=prior,
+            posterior=posterior,
+            variable=variable,
+            season=season,
+            location=location,
+            cutoff_date=cutoff_date,
+            init_year=init_year,
+            threshold=0.5,
+            save_path=enso_path,
+        )
+        print(f"  El Niño prob figure → {enso_path}")
+
     # ── STEP 9: Basic sanity checks (always) ────────────────────────────────
     print("\n[STEP 9] Running sanity checks …")
     validate.run_basic_checks(

@@ -167,6 +167,109 @@ def plot_updated_plume_monthly(ensemble: xr.DataArray,
 # FIGURE 2 — TERCILE PROBABILITY EVOLUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def plot_enso_nino_probability(ensemble: xr.DataArray,
+                               prior: GaussianDist,
+                               posterior: GaussianDist,
+                               variable: Variable,
+                               season: Season,
+                               location: Location,
+                               cutoff_date: date,
+                               init_year: int,
+                               threshold: float = 0.5,
+                               save_path: str | None = None) -> None:
+    """
+    Bar chart of P(Niño 3.4 anomaly > threshold) per target month.
+
+    Shows the prior (C3S ensemble) and posterior (Bayesian-updated) side by
+    side for each month.  Also reports the overall probability of El Niño
+    conditions in at least one of the target months.
+
+    The posterior ensemble is derived from the prior by shifting the mean
+    and rescaling the spread to match the posterior Gaussian parameters.
+
+    Parameters
+    ----------
+    ensemble  : grand C3S ensemble (member × month)
+    prior     : Gaussian prior
+    posterior : Gaussian posterior
+    variable  : Variable object
+    season    : Season object
+    location  : Location object
+    cutoff_date : observation cutoff
+    init_year : forecast year
+    threshold : El Niño anomaly threshold in K (default 0.5)
+    save_path : save figure to this path if given
+    """
+    target_months = ensemble.month.values
+    month_names   = [calendar.month_abbr[m] for m in target_months]
+    x     = np.arange(len(target_months))
+    width = 0.35
+
+    ens_values = ensemble.values   # (member, month)
+
+    # Posterior ensemble: shift mean, rescale spread
+    scale    = posterior.std / prior.std if prior.std > 0 else 1.0
+    ens_post = posterior.mean + (ens_values - prior.mean) * scale
+
+    # Per-month El Niño probability
+    p_prior = [(ens_values[:, i] > threshold).mean() * 100
+               for i in range(len(target_months))]
+    p_post  = [(ens_post[:, i]  > threshold).mean() * 100
+               for i in range(len(target_months))]
+
+    # Overall P(EN in at least one month)
+    p_any_prior = float(np.any(ens_values > threshold, axis=1).mean() * 100)
+    p_any_post  = float(np.any(ens_post   > threshold, axis=1).mean() * 100)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    bars_p = ax.bar(x - width / 2, p_prior, width,
+                    color=COLOUR_PRIOR,     alpha=0.7, label="Prior (C3S ensemble)")
+    bars_q = ax.bar(x + width / 2, p_post,  width,
+                    color=COLOUR_POSTERIOR, alpha=0.7, label="Posterior (updated)")
+
+    ax.axhline(50, color="grey", linewidth=1, linestyle="--", alpha=0.6)
+
+    # Value labels on bars
+    for bars, colour in [(bars_p, COLOUR_PRIOR), (bars_q, COLOUR_POSTERIOR)]:
+        for bar in bars:
+            h = bar.get_height()
+            if h > 3:
+                ax.text(bar.get_x() + bar.get_width() / 2, h + 1.5,
+                        f"{h:.0f}%", ha="center", va="bottom",
+                        fontsize=9, color=colour)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(month_names, fontsize=11)
+    ax.set_ylabel(f"P(anomaly > {threshold:.1f} K)  (%)", fontsize=11)
+    ax.set_ylim(0, 110)
+    ax.set_title(
+        f"El Niño probability (Niño 3.4 anomaly > {threshold:.1f} K) — "
+        f"{season.label} {init_year}\n"
+        f"{location.name} | updated to {cutoff_date.strftime('%d %b %Y')}",
+        fontsize=11,
+    )
+
+    ax.text(
+        0.98, 0.97,
+        f"P(El Niño in any month):\n"
+        f"Prior  : {p_any_prior:.0f}%\n"
+        f"Posterior: {p_any_post:.0f}%",
+        transform=ax.transAxes, ha="right", va="top", fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+    )
+
+    ax.legend(loc="upper left", fontsize=9)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"[PLOT] El Niño probability figure saved to {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+
 def plot_tercile_evolution(evolution_df: pd.DataFrame,
                             variable: Variable,
                             season: Season,
