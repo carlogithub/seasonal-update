@@ -62,6 +62,11 @@ class Location:
         """
         return self.name.lower().replace(" ", "_")
 
+    @property
+    def is_point(self) -> bool:
+        """True for single-point locations; False for area-average regions."""
+        return True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NINO 3.4 — SPECIAL SUBCLASS WITH FIXED REGION BOX
@@ -93,6 +98,10 @@ class Nino34Location(Location):
     @property
     def slug(self) -> str:
         return "nino34"
+
+    @property
+    def is_point(self) -> bool:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

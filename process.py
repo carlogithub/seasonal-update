@@ -124,6 +124,18 @@ def load_era5(nc_path: str, variable: Variable) -> xr.DataArray:
 
     da = da.sortby("time")
 
+    # Resample sub-daily (hourly) data to daily — timeseries endpoint delivers hourly
+    if len(da) > 1:
+        median_hours = float(
+            np.median(np.diff(da.time.values[:min(48, len(da))]).astype("timedelta64[h]").astype(float))
+        )
+        if median_hours < 12:
+            if variable.obs_type == "mean":
+                da = da.resample(time="1D").mean()
+            else:
+                da = da.resample(time="1D").sum()
+            print(f"[PROCESS] Resampled hourly → daily ({variable.obs_type})")
+
     print(f"[PROCESS] ERA5 {variable.short_name}: "
           f"{da.time.values[0]} → {da.time.values[-1]}, n={len(da)}")
     return da

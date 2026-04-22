@@ -157,6 +157,69 @@ def download_forecast_monthly(location: Location, variable: Variable,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ERA5 POINT TIME SERIES  (ARCO/ZARR-backed — fast for single points)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_era5_timeseries(location: Location, variable: Variable,
+                               start_year: int, end_year: int) -> str:
+    """
+    Download ERA5 as a single-point hourly time series using the
+    reanalysis-era5-single-levels-timeseries dataset.
+
+    This endpoint is backed by ARCO (Analysis-Ready Cloud-Optimized) ZARR
+    storage on the CDS side, making single-point requests much faster than
+    the standard ERA5 download (~30–60 s vs several minutes).
+
+    Delivers hourly NetCDF inside a ZIP. process.load_era5() resamples to
+    daily automatically when it detects sub-daily resolution.
+
+    Only valid for point locations (location.is_point must be True).
+    """
+    _ensure_dirs()
+
+    nc_path  = os.path.join(config.ERA5_DIR, f"era5_{variable.slug}_{location.slug}.nc")
+    zip_path = nc_path.replace(".nc", "_download.tmp")
+
+    if os.path.exists(nc_path):
+        print(f"[ERA5-TS] Already downloaded: {nc_path}")
+        return nc_path
+
+    from datetime import date as _date
+    end_date   = _date(end_year + 1, 12, 31)
+    actual_end = min(end_date, _date.today()).strftime("%Y-%m-%d")
+    start_str  = f"{start_year}-01-01"
+
+    print(f"[ERA5-TS] Downloading {variable.name} time series for {location.name} "
+          f"{start_year}–{end_year} (ARCO endpoint) …")
+
+    c = _cds_client()
+    c.retrieve(
+        "reanalysis-era5-single-levels-timeseries",
+        {
+            "variable":     [variable.era5_name],
+            "location":     {"latitude": location.lat, "longitude": location.lon},
+            "date":         f"{start_str}/{actual_end}",
+            "data_format":  "netcdf",
+        },
+        zip_path,
+    )
+
+    if zipfile.is_zipfile(zip_path):
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            nc_names = [n for n in zf.namelist() if n.endswith(".nc")]
+            if not nc_names:
+                raise RuntimeError("ERA5 timeseries ZIP contains no .nc file")
+            zf.extract(nc_names[0], config.ERA5_DIR)
+            os.rename(os.path.join(config.ERA5_DIR, nc_names[0]), nc_path)
+        os.remove(zip_path)
+    else:
+        os.rename(zip_path, nc_path)
+
+    print(f"[ERA5-TS] Saved to {nc_path}")
+    return nc_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # C3S POST-PROCESSED FORECAST  (bias-corrected anomalies — preferred path)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -305,11 +368,18 @@ def download_all(location: Location, variable: Variable, season: Season,
     """
     results = {"era5": None, "hindcast_clim": {}, "forecast": {}}
 
-    results["era5"] = download_era5(
-        location, variable, season,
-        start_year=config.HINDCAST_START_YEAR,
-        end_year=init_year,
-    )
+    if location.is_point:
+        results["era5"] = download_era5_timeseries(
+            location, variable,
+            start_year=config.HINDCAST_START_YEAR,
+            end_year=init_year,
+        )
+    else:
+        results["era5"] = download_era5(
+            location, variable, season,
+            start_year=config.HINDCAST_START_YEAR,
+            end_year=init_year,
+        )
 
     for model_name in config.MODELS:
         postproc_path = download_forecast_postprocessed(
