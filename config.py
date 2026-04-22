@@ -44,9 +44,6 @@ TERCILE_UPPER = 2.0 / 3.0   # 66.7 % — upper boundary of near-normal category
 # system             : model version number (check CDS catalogue if this changes)
 # n_members          : number of ensemble members for forecast runs
 #
-# NOTE: as of April 2026 only the ECMWF SEAS5.1 entry (system=51) reliably
-# returns data for recent operational forecasts.  The other models return
-# MarsNoDataError — their system numbers may need updating from the CDS catalogue.
 
 MODELS = {
     "ecmwf": {
@@ -56,22 +53,22 @@ MODELS = {
     },
     "ukmo": {
         "originating_centre": "ukmo",
-        "system": "600",        # GloSea6 — may need updating
+        "system": "600",        # GloSea6
         "n_members": 28,
     },
     "meteo_france": {
         "originating_centre": "meteo_france",
-        "system": "8",          # System 8 — may need updating
+        "system": "9",          # System 9 (updated from 8 for 2026 forecasts)
         "n_members": 25,
     },
     "dwd": {
         "originating_centre": "dwd",
-        "system": "21",         # GCFS2.1 — may need updating
+        "system": "22",         # GCFS2.2 (updated from 21 for 2026 forecasts)
         "n_members": 30,
     },
     "cmcc": {
         "originating_centre": "cmcc",
-        "system": "35",         # SPS3.5 — may need updating
+        "system": "4",          # SPS3.5 (updated from 35 for 2026 forecasts)
         "n_members": 40,
     },
 }
