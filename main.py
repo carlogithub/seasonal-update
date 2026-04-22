@@ -42,9 +42,10 @@ import config
 import download
 import process
 import bayesian_update
+import validate
 import visualize
 
-from location import LOCATIONS
+from location import LOCATIONS, Location
 from variable import VARIABLES
 from season   import SEASONS
 
@@ -57,9 +58,27 @@ def parse_args():
     parser.add_argument(
         "--location",
         type=str,
-        default="nino34",
+        default=None,
         choices=list(LOCATIONS.keys()),
-        help=f"Location key: {list(LOCATIONS.keys())}",
+        help=f"Preset location key: {list(LOCATIONS.keys())}",
+    )
+    parser.add_argument(
+        "--lat",
+        type=float,
+        default=None,
+        help="Custom location latitude °N (use with --lon instead of --location)",
+    )
+    parser.add_argument(
+        "--lon",
+        type=float,
+        default=None,
+        help="Custom location longitude °E (use with --lat instead of --location)",
+    )
+    parser.add_argument(
+        "--location-name",
+        type=str,
+        default=None,
+        help="Name for a custom lat/lon location (optional, used in titles and filenames)",
     )
     parser.add_argument(
         "--variable",
@@ -92,13 +111,28 @@ def parse_args():
         action="store_true",
         help="Skip CDS downloads (use existing files in data/)",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run leave-one-out cross-validation after the main pipeline",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    location    = LOCATIONS[args.location]
+    if args.lat is not None and args.lon is not None:
+        loc_name = args.location_name or (
+            f"{abs(args.lat):.2f}{'N' if args.lat >= 0 else 'S'}_"
+            f"{abs(args.lon):.2f}{'E' if args.lon >= 0 else 'W'}"
+        )
+        location = Location(loc_name, args.lat, args.lon)
+    elif args.location is not None:
+        location = LOCATIONS[args.location]
+    else:
+        raise SystemExit("error: provide --location OR both --lat and --lon")
+
     variable    = VARIABLES[args.variable]
     season      = SEASONS[args.season]
     init_year   = args.init_year
@@ -278,7 +312,30 @@ def main():
         save_path=evol_path,
     )
 
-    print("\nDone.")
+    # ── STEP 9: Basic sanity checks (always) ────────────────────────────────
+    print("\n[STEP 9] Running sanity checks …")
+    validate.run_basic_checks(
+        prior, posterior, grand_ensemble, era5_anomaly, reg,
+        variable, season, cutoff_day,
+        t_lower, t_upper, probs, prior_probs,
+        config.HINDCAST_START_YEAR, config.HINDCAST_END_YEAR,
+    )
+
+    # ── STEP 10: LOO cross-validation (--validate only) ─────────────────────
+    if args.validate:
+        print("[STEP 10] Leave-one-out cross-validation …")
+        loo_path = os.path.join(config.OUTPUT_DIR, f"loo_{tag}.csv")
+        validate.run_loo_validation(
+            era5_anomaly, prior, variable, season,
+            cutoff_day=cutoff_day,
+            hindcast_start=config.HINDCAST_START_YEAR,
+            hindcast_end=config.HINDCAST_END_YEAR,
+            t_lower=t_lower,
+            t_upper=t_upper,
+            save_path=loo_path,
+        )
+
+    print("Done.")
     print(f"  Plume figure     → {plume_path}")
     print(f"  Evolution figure → {evol_path}")
 

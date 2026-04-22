@@ -78,7 +78,9 @@ def fit_era5_regression(era5_anomaly: xr.DataArray,
                          season: Season,
                          cutoff_day: int,
                          hindcast_start: int,
-                         hindcast_end: int) -> RegressionParams:
+                         hindcast_end: int,
+                         exclude_years: list | None = None,
+                         verbose: bool = True) -> RegressionParams:
     """
     Fit Y = α + β·x + ε using historical ERA5 data.
 
@@ -104,6 +106,8 @@ def fit_era5_regression(era5_anomaly: xr.DataArray,
     y_vals = []
 
     for year in range(hindcast_start, hindcast_end + 1):
+        if exclude_years and year in exclude_years:
+            continue
         try:
             # ── Predictor x: partial init-month aggregate ─────────────────────
             partial = era5_anomaly.sel(
@@ -165,9 +169,10 @@ def fit_era5_regression(era5_anomaly: xr.DataArray,
     residuals = y_arr - y_pred
     sigma_eps = float(np.std(residuals, ddof=2))
 
-    print(f"[BAYES] ERA5 regression ({variable.short_name}): "
-          f"α={intercept:.3f}, β={slope:.3f}, σ={sigma_eps:.3f}, "
-          f"R²={r_value**2:.2f}  (n={len(x_vals)} years)")
+    if verbose:
+        print(f"[BAYES] ERA5 regression ({variable.short_name}): "
+              f"α={intercept:.3f}, β={slope:.3f}, σ={sigma_eps:.3f}, "
+              f"R²={r_value**2:.2f}  (n={len(x_vals)} years)")
 
     return RegressionParams(
         alpha=float(intercept),
