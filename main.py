@@ -323,7 +323,7 @@ def main():
             location=location,
             cutoff_date=cutoff_date,
             init_year=init_year,
-            threshold=0.5,
+            thresholds=[0.5, 1.0, 1.5],
             save_path=enso_path,
         )
         print(f"  El Niño prob figure → {enso_path}")
